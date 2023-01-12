@@ -96,7 +96,7 @@ enum RelocationError {
 
     /// Relocation not valid for type
     #[error(
-        "relocation #{relocation_number} of kind `{relocation_kind}` not valid for type `{type_kind}`: {error}"
+    "relocation #{relocation_number} of kind `{relocation_kind}` not valid for type `{type_kind}`: {error}"
     )]
     InvalidRelocationKindForType {
         /// The relocation number
@@ -111,7 +111,7 @@ enum RelocationError {
 
     /// Invalid instruction referenced by relocation
     #[error(
-        "instruction #{index} referenced by relocation #{relocation_number} is invalid: {error}"
+    "instruction #{index} referenced by relocation #{relocation_number} is invalid: {error}"
     )]
     InvalidInstruction {
         /// The relocation number
@@ -406,19 +406,36 @@ fn match_candidate<'target>(
             let target_ty = candidate.btf.type_by_id(target_id)?;
             // the first accessor is guaranteed to have a name by construction
             let local_variant_name = local_spec.accessors[0].name.as_ref().unwrap();
+            let match_enum =
+                |name_offset, index, target_spec: &mut AccessSpec| -> Result<_, BtfError> {
+                    let target_variant_name = candidate.btf.string_at(name_offset)?;
+                    if flavorless_name(local_variant_name) == flavorless_name(&target_variant_name)
+                    {
+                        target_spec.parts.push(index);
+                        target_spec.accessors.push(Accessor {
+                            index,
+                            type_id: target_id,
+                            name: None,
+                        });
+                        Ok(Some(()))
+                    } else {
+                        Ok(None)
+                    }
+                };
+
             match target_ty {
                 BtfType::Enum(en) => {
                     for (index, member) in en.variants.iter().enumerate() {
-                        let target_variant_name = candidate.btf.string_at(member.name_offset)?;
-                        if flavorless_name(local_variant_name)
-                            == flavorless_name(&target_variant_name)
+                        if let Ok(Some(_)) = match_enum(member.name_offset, index, &mut target_spec)
                         {
-                            target_spec.parts.push(index);
-                            target_spec.accessors.push(Accessor {
-                                index,
-                                type_id: target_id,
-                                name: None,
-                            });
+                            return Ok(Some(target_spec));
+                        }
+                    }
+                }
+                BtfType::Enum64(en) => {
+                    for (index, member) in en.variants.iter().enumerate() {
+                        if let Ok(Some(_)) = match_enum(member.name_offset, index, &mut target_spec)
+                        {
                             return Ok(Some(target_spec));
                         }
                     }
@@ -620,29 +637,38 @@ impl<'a> AccessSpec<'a> {
                 }
             }
             RelocationKind::EnumVariantExists | RelocationKind::EnumVariantValue => match ty {
-                BtfType::Enum(en) => {
+                BtfType::Enum(_) | BtfType::Enum64(_) => {
                     if parts.len() != 1 {
                         return Err(RelocationError::InvalidAccessString {
                             access_str: spec.to_string(),
                         });
                     }
                     let index = parts[0];
-                    if index >= en.variants.len() {
+                    let (n_variants, name_offset) = match ty {
+                        BtfType::Enum(en) => (
+                            en.variants.len(),
+                            en.variants.get(index).map(|v| v.name_offset),
+                        ),
+                        BtfType::Enum64(en) => (
+                            en.variants.len(),
+                            en.variants.get(index).map(|v| v.name_offset),
+                        ),
+                        _ => unreachable!(),
+                    };
+
+                    if name_offset.is_none() {
                         return Err(RelocationError::InvalidAccessIndex {
                             type_name: btf.err_type_name(ty),
                             spec: spec.to_string(),
                             index,
-                            max_index: en.variants.len(),
+                            max_index: n_variants,
                             error: "tried to access nonexistant enum variant".to_string(),
                         });
                     }
                     let accessors = vec![Accessor {
                         type_id,
                         index,
-                        name: Some(
-                            btf.string_at(en.variants.get(index).unwrap().name_offset)?
-                                .to_string(),
-                        ),
+                        name: Some(btf.string_at(name_offset.unwrap())?.to_string()),
                     }];
 
                     AccessSpec {
@@ -786,7 +812,7 @@ struct ComputedRelocation {
 
 #[derive(Debug)]
 struct ComputedRelocationValue {
-    value: u32,
+    value: u64,
     size: u32,
     type_id: Option<u32>,
 }
@@ -854,7 +880,7 @@ impl ComputedRelocation {
                 ins.imm = target_value as i32;
             }
             BPF_LDX | BPF_ST | BPF_STX => {
-                if target_value > i16::MAX as u32 {
+                if target_value > i16::MAX as u64 {
                     return Err(RelocationError::InvalidInstruction {
                         relocation_number: rel.number,
                         index: ins_index,
@@ -872,7 +898,7 @@ impl ComputedRelocation {
                     match (local_ty, target_ty) {
                         (Ptr(_), Ptr(_)) => {}
                         (Int(local), Int(target))
-                            if unsigned(local.data) && unsigned(target.data) => {}
+                        if unsigned(local.data) && unsigned(target.data) => {}
                         _ => {
                             return Err(RelocationError::InvalidInstruction {
                                 relocation_number: rel.number,
@@ -914,7 +940,7 @@ impl ComputedRelocation {
                     },
                 )?;
 
-                next_ins.imm = 0;
+                next_ins.imm = (target_value >> 32) as i32;
             }
             class => {
                 return Err(RelocationError::InvalidInstruction {
@@ -934,11 +960,11 @@ impl ComputedRelocation {
     ) -> Result<ComputedRelocationValue, RelocationError> {
         use RelocationKind::*;
         let value = match (rel.kind, spec) {
-            (EnumVariantExists, spec) => spec.is_some() as u32,
+            (EnumVariantExists, spec) => spec.is_some() as u64,
             (EnumVariantValue, Some(spec)) => {
                 let accessor = &spec.accessors[0];
                 match spec.btf.type_by_id(accessor.type_id)? {
-                    BtfType::Enum(en) => en.variants[accessor.index].value as u32,
+                    BtfType::Enum(en) => en.variants[accessor.index].value as u64,
                     // candidate selection ensures that rel_kind == local_kind == target_kind
                     _ => unreachable!(),
                 }
@@ -969,7 +995,7 @@ impl ComputedRelocation {
             // this is the bpf_preserve_field_info(member_access, FIELD_EXISTENCE) case. If we
             // managed to build a spec, it means the field exists.
             return Ok(ComputedRelocationValue {
-                value: spec.is_some() as u32,
+                value: spec.is_some() as u64,
                 size: 0,
                 type_id: None,
             });
@@ -991,12 +1017,12 @@ impl ComputedRelocation {
             // the last accessor is unnamed, meaning that this is an array access
             return match rel.kind {
                 FieldByteOffset => Ok(ComputedRelocationValue {
-                    value: (spec.bit_offset / 8) as u32,
+                    value: (spec.bit_offset / 8) as u64,
                     size: spec.btf.type_size(accessor.type_id)? as u32,
                     type_id: Some(accessor.type_id),
                 }),
                 FieldByteSize => Ok(ComputedRelocationValue {
-                    value: spec.btf.type_size(accessor.type_id)? as u32,
+                    value: spec.btf.type_size(accessor.type_id)? as u64,
                     size: 0,
                     type_id: Some(accessor.type_id),
                 }),
@@ -1061,30 +1087,31 @@ impl ComputedRelocation {
         #[allow(clippy::wildcard_in_or_patterns)]
         match rel.kind {
             FieldByteOffset => {
-                value.value = byte_off;
+                value.value = byte_off as u64;
                 if !is_bitfield {
                     value.size = byte_size;
                     value.type_id = Some(member_type_id);
                 }
             }
             FieldByteSize => {
-                value.value = byte_size;
+                value.value = byte_size as u64;
             }
             FieldSigned => match member_ty {
                 BtfType::Enum(_) => value.value = 1,
-                BtfType::Int(i) => value.value = i.encoding() as u32 & IntEncoding::Signed as u32,
+                BtfType::Enum64(en) => value.value = en.is_signed() as u64,
+                BtfType::Int(i) => value.value = i.encoding() as u64 & IntEncoding::Signed as u64,
                 _ => (),
             },
             #[cfg(target_endian = "little")]
             FieldLShift64 => {
-                value.value = 64 - (bit_off + bit_size - byte_off * 8);
+                value.value = 64 - (bit_off + bit_size - byte_off * 8) as u64;
             }
             #[cfg(target_endian = "big")]
             FieldLShift64 => {
                 value.value = (8 - byte_size) * 8 + (bit_off - byte_off * 8);
             }
             FieldRShift64 => {
-                value.value = 64 - bit_size;
+                value.value = 64 - bit_size as u64;
             }
             FieldExists // this is handled at the start of the function
             | _ => panic!("bug! this should not be reached"),
@@ -1101,11 +1128,11 @@ impl ComputedRelocation {
         use RelocationKind::*;
 
         let value = match (rel.kind, target_spec) {
-            (TypeIdLocal, _) => local_spec.root_type_id,
-            (TypeIdTarget, Some(target_spec)) => target_spec.root_type_id,
-            (TypeExists, target_spec) => target_spec.is_some() as u32,
+            (TypeIdLocal, _) => local_spec.root_type_id as u64,
+            (TypeIdTarget, Some(target_spec)) => target_spec.root_type_id as u64,
+            (TypeExists, target_spec) => target_spec.is_some() as u64,
             (TypeSize, Some(target_spec)) => {
-                target_spec.btf.type_size(target_spec.root_type_id)? as u32
+                target_spec.btf.type_size(target_spec.root_type_id)? as u64
             }
             _ => {
                 return Err(RelocationError::MissingTargetDefinition {
